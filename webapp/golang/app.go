@@ -14,6 +14,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/bradfitz/gomemcache/memcache"
@@ -65,6 +66,9 @@ type Comment struct {
 	CreatedAt time.Time `db:"created_at"`
 	User      User
 }
+
+var userCache = make(map[int]User)
+var userCacheMutex sync.RWMutex
 
 func init() {
 	memdAddr := os.Getenv("ISUCONP_MEMCACHED_ADDRESS")
@@ -148,12 +152,27 @@ func getSessionUser(r *http.Request) User {
 		return User{}
 	}
 
-	u := User{}
+	userID := uid.(int64)
+	userIDInt := int(userID)
 
-	err := db.Get(&u, "SELECT * FROM `users` WHERE `id` = ?", uid)
+	// キャッシュから取得を試行
+	userCacheMutex.RLock()
+	if user, exists := userCache[userIDInt]; exists {
+		userCacheMutex.RUnlock()
+		return user
+	}
+	userCacheMutex.RUnlock()
+
+	u := User{}
+	err := db.Get(&u, "SELECT * FROM `users` WHERE `id` = ?", userID)
 	if err != nil {
 		return User{}
 	}
+
+	// キャッシュに保存
+	userCacheMutex.Lock()
+	userCache[userIDInt] = u
+	userCacheMutex.Unlock()
 
 	return u
 }
