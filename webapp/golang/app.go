@@ -171,55 +171,131 @@ func getFlash(w http.ResponseWriter, r *http.Request, key string) string {
 	}
 }
 
-func makePosts(results []Post, csrfToken string, allComments bool) ([]Post, error) {
-	var posts []Post
+/ Optimized makePosts with batch loading
+func makePostsOptimized(results []Post, csrfToken string, allComments bool) ([]Post, error) {
+	if len(results) == 0 {
+		return []Post{}, nil
+	}
+
+	// Collect all post IDs and user IDs
+	postIDs := make([]int, 0, len(results))
+	userIDs := make(map[int]bool)
 
 	for _, p := range results {
-		err := db.Get(&p.CommentCount, "SELECT COUNT(*) AS `count` FROM `comments` WHERE `post_id` = ?", p.ID)
+		postIDs = append(postIDs, p.ID)
+		userIDs[p.UserID] = true
+	}
+
+	// Batch load comment counts
+	commentCounts := make(map[int]int)
+	if len(postIDs) > 0 {
+		query := `
+			SELECT post_id, COUNT(*) as count
+			FROM comments
+			WHERE post_id IN (?)
+			GROUP BY post_id
+		`
+		query, args, _ := sqlx.In(query, postIDs)
+
+		rows, err := db.Query(query, args...)
 		if err != nil {
 			return nil, err
 		}
+		defer rows.Close()
 
-		query := "SELECT * FROM `comments` WHERE `post_id` = ? ORDER BY `created_at` DESC"
+		for rows.Next() {
+			var postID, count int
+			rows.Scan(&postID, &count)
+			commentCounts[postID] = count
+		}
+	}
+
+	// Batch load comments with users
+	commentsMap := make(map[int][]Comment)
+	if len(postIDs) > 0 {
+		limit := ""
 		if !allComments {
-			query += " LIMIT 3"
+			// For non-full view, we need to get top 3 comments per post
+			// This is complex in one query, so we'll optimize differently
+			limit = "LIMIT 3"
 		}
-		var comments []Comment
-		err = db.Select(&comments, query, p.ID)
+
+		// Get all comments for these posts
+		query := `
+			SELECT
+				c.id, c.post_id, c.user_id, c.comment, c.created_at,
+				u.id as 'user.id', u.account_name as 'user.account_name',
+				u.authority as 'user.authority', u.del_flg as 'user.del_flg'
+			FROM comments c
+			JOIN users u ON c.user_id = u.id
+			WHERE c.post_id IN (?)
+			ORDER BY c.post_id, c.created_at DESC
+		`
+		query, args, _ := sqlx.In(query, postIDs)
+
+		rows, err := db.Query(query, args...)
 		if err != nil {
 			return nil, err
 		}
+		defer rows.Close()
 
-		for i := 0; i < len(comments); i++ {
-			err := db.Get(&comments[i].User, "SELECT * FROM `users` WHERE `id` = ?", comments[i].UserID)
+		for rows.Next() {
+			var c Comment
+			var u User
+			err := rows.Scan(&c.ID, &c.PostID, &c.UserID, &c.Comment, &c.CreatedAt,
+				&u.ID, &u.AccountName, &u.Authority, &u.DelFlg)
 			if err != nil {
-				return nil, err
+				continue
 			}
-		}
+			c.User = u
 
-		// reverse
+			if !allComments && len(commentsMap[c.PostID]) >= 3 {
+				continue
+			}
+
+			commentsMap[c.PostID] = append(commentsMap[c.PostID], c)
+		}
+	}
+
+	// Batch load post users
+	userIDsList := make([]int, 0, len(userIDs))
+	for uid := range userIDs {
+		userIDsList = append(userIDsList, uid)
+	}
+
+	users, err := getUsersByIDs(userIDsList)
+	if err != nil {
+		return nil, err
+	}
+
+	// Assemble final posts
+	var posts []Post
+	for _, p := range results {
+		p.CommentCount = commentCounts[p.ID]
+
+		// Reverse comments order (they come in DESC, we want ASC for display)
+		comments := commentsMap[p.ID]
 		for i, j := 0, len(comments)-1; i < j; i, j = i+1, j-1 {
 			comments[i], comments[j] = comments[j], comments[i]
 		}
-
 		p.Comments = comments
 
-		err = db.Get(&p.User, "SELECT * FROM `users` WHERE `id` = ?", p.UserID)
-		if err != nil {
-			return nil, err
-		}
-
-		p.CSRFToken = csrfToken
-
-		if p.User.DelFlg == 0 {
+		if u, ok := users[p.UserID]; ok && u.DelFlg == 0 {
+			p.User = u
+			p.CSRFToken = csrfToken
 			posts = append(posts, p)
 		}
+
 		if len(posts) >= postsPerPage {
 			break
 		}
 	}
 
 	return posts, nil
+}
+
+func makePosts(results []Post, csrfToken string, allComments bool) ([]Post, error) {
+	return makePostsOptimized(results, csrfToken, allComments)
 }
 
 func imageURL(p Post) string {
