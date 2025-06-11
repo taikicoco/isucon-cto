@@ -174,52 +174,136 @@ func getFlash(w http.ResponseWriter, r *http.Request, key string) string {
 func makePosts(results []Post, csrfToken string, allComments bool) ([]Post, error) {
 	var posts []Post
 
-	for _, p := range results {
-		err := db.Get(&p.CommentCount, "SELECT COUNT(*) AS `count` FROM `comments` WHERE `post_id` = ?", p.ID)
-		if err != nil {
-			return nil, err
-		}
+	if len(results) == 0 {
+		return posts, nil
+	}
 
-		query := "SELECT * FROM `comments` WHERE `post_id` = ? ORDER BY `created_at` DESC"
-		if !allComments {
-			query += " LIMIT 3"
-		}
-		var comments []Comment
-		err = db.Select(&comments, query, p.ID)
-		if err != nil {
-			return nil, err
-		}
+	// 投稿IDを取得
+	postIDs := make([]int, len(results))
+	postMap := make(map[int]*Post)
 
-		for i := 0; i < len(comments); i++ {
-			err := db.Get(&comments[i].User, "SELECT * FROM `users` WHERE `id` = ?", comments[i].UserID)
-			if err != nil {
-				return nil, err
-			}
+	for i, p := range results {
+		postIDs[i] = p.ID
+		posts = append(posts, p)
+		postMap[p.ID] = &posts[i]
+	}
+
+	// 1. ユーザー情報を一括取得
+	userIDs := make([]int, len(results))
+	for i, p := range results {
+		userIDs[i] = p.UserID
+	}
+
+	// ユーザー情報をIN句で一括取得
+	userQuery := `SELECT * FROM users WHERE id IN (?` + strings.Repeat(",?", len(userIDs)-1) + `)`
+	args := make([]interface{}, len(userIDs))
+	for i, v := range userIDs {
+		args[i] = v
+	}
+
+	var users []User
+	err := db.Select(&users, userQuery, args...)
+	if err != nil {
+		return nil, err
+	}
+
+	userMap := make(map[int]User)
+	for _, user := range users {
+		userMap[user.ID] = user
+	}
+
+	// 2. コメント数を一括取得
+	commentCountQuery := `
+		SELECT post_id, COUNT(*) as count 
+		FROM comments 
+		WHERE post_id IN (?` + strings.Repeat(",?", len(postIDs)-1) + `) 
+		GROUP BY post_id`
+
+	postIDArgs := make([]interface{}, len(postIDs))
+	for i, v := range postIDs {
+		postIDArgs[i] = v
+	}
+
+	type CommentCount struct {
+		PostID int `db:"post_id"`
+		Count  int `db:"count"`
+	}
+
+	var commentCounts []CommentCount
+	err = db.Select(&commentCounts, commentCountQuery, postIDArgs...)
+	if err != nil {
+		return nil, err
+	}
+
+	commentCountMap := make(map[int]int)
+	for _, cc := range commentCounts {
+		commentCountMap[cc.PostID] = cc.Count
+	}
+
+	// 3. コメントとコメントユーザーを一括取得（JOINを使用）
+	commentQuery := `
+		SELECT c.*, u.id as user_id, u.account_name, u.passhash, u.authority, u.del_flg, u.created_at as user_created_at
+		FROM comments c
+		JOIN users u ON c.user_id = u.id
+		WHERE c.post_id IN (?` + strings.Repeat(",?", len(postIDs)-1) + `)
+		ORDER BY c.post_id, c.created_at DESC`
+
+	if !allComments {
+		// 各投稿につき最新3件のコメントのみを取得するサブクエリ
+		commentQuery = `
+			SELECT c.*, u.id as user_id, u.account_name, u.passhash, u.authority, u.del_flg, u.created_at as user_created_at
+			FROM (
+				SELECT *,
+					ROW_NUMBER() OVER (PARTITION BY post_id ORDER BY created_at DESC) as rn
+				FROM comments
+				WHERE post_id IN (?` + strings.Repeat(",?", len(postIDs)-1) + `)
+			) c
+			JOIN users u ON c.user_id = u.id
+			WHERE c.rn <= 3
+			ORDER BY c.post_id, c.created_at DESC`
+	}
+
+	type CommentWithUser struct {
+		Comment
+		User User `db:"u"`
+	}
+
+	var commentWithUsers []CommentWithUser
+	err = db.Select(&commentWithUsers, commentQuery, postIDArgs...)
+	if err != nil {
+		return nil, err
+	}
+
+	// コメントをpost_idでグループ化
+	commentsByPostID := make(map[int][]Comment)
+	for _, cw := range commentWithUsers {
+		cw.Comment.User = cw.User
+		commentsByPostID[cw.Comment.PostID] = append(commentsByPostID[cw.Comment.PostID], cw.Comment)
+	}
+
+	// 結果をアセンブル
+	var finalPosts []Post
+	for i := range posts {
+		posts[i].User = userMap[posts[i].UserID]
+		posts[i].CommentCount = commentCountMap[posts[i].ID]
+		posts[i].CSRFToken = csrfToken
+
+		// コメントを逆順にする（古い順）
+		comments := commentsByPostID[posts[i].ID]
+		for j, k := 0, len(comments)-1; j < k; j, k = j+1, k-1 {
+			comments[j], comments[k] = comments[k], comments[j]
 		}
+		posts[i].Comments = comments
 
-		// reverse
-		for i, j := 0, len(comments)-1; i < j; i, j = i+1, j-1 {
-			comments[i], comments[j] = comments[j], comments[i]
+		if posts[i].User.DelFlg == 0 {
+			finalPosts = append(finalPosts, posts[i])
 		}
-
-		p.Comments = comments
-
-		err = db.Get(&p.User, "SELECT * FROM `users` WHERE `id` = ?", p.UserID)
-		if err != nil {
-			return nil, err
-		}
-
-		p.CSRFToken = csrfToken
-
-		if p.User.DelFlg == 0 {
-			posts = append(posts, p)
-		}
-		if len(posts) >= postsPerPage {
+		if len(finalPosts) >= postsPerPage {
 			break
 		}
 	}
 
-	return posts, nil
+	return finalPosts, nil
 }
 
 func imageURL(p Post) string {
@@ -386,7 +470,7 @@ func getIndex(w http.ResponseWriter, r *http.Request) {
 
 	results := []Post{}
 
-	err := db.Select(&results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` ORDER BY `created_at` DESC")
+	err := db.Select(&results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` ORDER BY `created_at` DESC LIMIT ?", postsPerPage*2)
 	if err != nil {
 		log.Print(err)
 		return
